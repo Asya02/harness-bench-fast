@@ -255,7 +255,7 @@ wheels = [
 
 [[package]]
 name = "deepagents"
-version = "0.6.4"
+version = "0.6.7"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "langchain" },
@@ -265,34 +265,23 @@ dependencies = [
     { name = "langsmith" },
     { name = "wcmatch" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/c0/6b/b40d13fd003fd8d0bddabdc4c5e4467b00710fd1cd6f2eae431fb2871300/deepagents-0.6.4.tar.gz", hash = "sha256:97fe9dba710f987197dd29a183e44d1bf828e400a1a60ee38d5508597db3ebfe", size = 182423, upload-time = "2026-05-26T18:53:46.889Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/51/bb/bb837a2c51631fe9d7eedf6aca7629ddca6336831801e75efcd2f5fa9c27/deepagents-0.6.7.tar.gz", hash = "sha256:af7b5857b28e29a847a4ced4cc7aaa809d33d42107696b1ca5d978d17e96b831", size = 194236, upload-time = "2026-05-30T04:42:14.591Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/80/01/68f60b3633cc07958e71ac103a2a92841cefc13a23661f28643865b92290/deepagents-0.6.4-py3-none-any.whl", hash = "sha256:10125ea3665740afddd384e837016875fbf703f7993865db72081109b5d2615d", size = 206371, upload-time = "2026-05-26T18:53:45.43Z" },
+    { url = "https://files.pythonhosted.org/packages/97/25/3a7f23d04778ccb95542f1b1ed39826290916221cc8203d0fb8b26c3edc1/deepagents-0.6.7-py3-none-any.whl", hash = "sha256:3518c1e5f4b9f6588ba39912b668b42b5c864b99a638e94c166d1c7176c7388e", size = 218740, upload-time = "2026-05-30T04:42:13.225Z" },
 ]
 
 [[package]]
 name = "deepagents-gigachat"
 version = "0.0.2"
-source = { editable = "../deepagents-gigachat" }
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "deepagents" },
     { name = "langchain-gigachat" },
     { name = "python-dotenv" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "deepagents", specifier = ">=0.6.4" },
-    { name = "langchain-gigachat", specifier = ">=0.5.0" },
-    { name = "python-dotenv", specifier = ">=1.2.2" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "langchain-openai", specifier = ">=1.2.1" },
-    { name = "openpyxl", specifier = ">=3.1" },
-    { name = "pytest", specifier = ">=9.0.2" },
-    { name = "ruff", specifier = ">=0.15.12" },
+sdist = { url = "https://files.pythonhosted.org/packages/99/98/5d5c5eafae55f5e9850d406e61ea3e2aa14e6ba01f94ddc75988c520a5e4/deepagents_gigachat-0.0.2.tar.gz", hash = "sha256:3408dfd52756c9b9e47c5dec879c302b0fa74faaf4dc5ed419033d7b050e7d68", size = 16091, upload-time = "2026-05-25T11:44:51.053Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/0d/74/8020ab8d28430c066e09ad8697461d40d7e6e15e932d20e4073a3cc84a99/deepagents_gigachat-0.0.2-py3-none-any.whl", hash = "sha256:8c9a02ab742e57e4dd7456d1c0e3448bd4e85078ebb4ec6b66abe23a9485f3e2", size = 16538, upload-time = "2026-05-25T11:44:49.332Z" },
 ]
 
 [[package]]
@@ -403,6 +392,7 @@ dependencies = [
     { name = "pytest" },
     { name = "python-dotenv" },
     { name = "pyyaml" },
+    { name = "tzdata" },
 ]
 
 [package.optional-dependencies]
@@ -427,8 +417,8 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "deepagents", specifier = ">=0.6.4" },
-    { name = "deepagents-gigachat", marker = "extra == 'gigachat-profile'", editable = "../deepagents-gigachat" },
+    { name = "deepagents", specifier = ">=0.6.7" },
+    { name = "deepagents-gigachat", marker = "extra == 'gigachat-profile'", specifier = ">=0.0.2" },
     { name = "langchain-gigachat", marker = "extra == 'gigachat'", specifier = ">=0.5.0" },
     { name = "langchain-gigachat", marker = "extra == 'gigachat-profile'", specifier = ">=0.5.0" },
     { name = "langchain-openai", marker = "extra == 'openrouter'", specifier = ">=1.2.1" },
@@ -436,12 +426,13 @@ requires-dist = [
     { name = "pytest", specifier = ">=9.0.2" },
     { name = "python-dotenv", specifier = ">=1.2.2" },
     { name = "pyyaml", specifier = ">=6.0" },
+    { name = "tzdata", specifier = ">=2025.2" },
 ]
 provides-extras = ["gigachat", "gigachat-profile", "openrouter"]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "deepagents-gigachat", editable = "../deepagents-gigachat" },
+    { name = "deepagents-gigachat", specifier = ">=0.0.2" },
     { name = "langchain-gigachat", specifier = ">=0.5.0" },
     { name = "langchain-openai", specifier = ">=1.2.1" },
     { name = "ruff", specifier = ">=0.15.12" },
@@ -1355,6 +1346,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/55/e3/70399cb7dd41c10ac53367ae42139cf4b1ca5f36bb3dc6c9d33acdb43655/typing_inspection-0.4.2.tar.gz", hash = "sha256:ba561c48a67c5958007083d386c3295464928b01faa735ab8547c5692e87f464", size = 75949, upload-time = "2025-10-01T02:14:41.687Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/dc/9b/47798a6c91d8bdb567fe2698fe81e0c6b7cb7ef4d13da4114b41d239f65d/typing_inspection-0.4.2-py3-none-any.whl", hash = "sha256:4ed1cacbdc298c220f1bd249ed5287caa16f34d44ef4e9c3d0cbad5b521545e7", size = 14611, upload-time = "2025-10-01T02:14:40.154Z" },
+]
+
+[[package]]
+name = "tzdata"
+version = "2026.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/ba/19/1b9b0e29f30c6d35cb345486df41110984ea67ae69dddbc0e8a100999493/tzdata-2026.2.tar.gz", hash = "sha256:9173fde7d80d9018e02a662e168e5a2d04f87c41ea174b139fbef642eda62d10", size = 198254, upload-time = "2026-04-24T15:22:08.651Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ce/e4/dccd7f47c4b64213ac01ef921a1337ee6e30e8c6466046018326977efd95/tzdata-2026.2-py2.py3-none-any.whl", hash = "sha256:bbe9af844f658da81a5f95019480da3a89415801f6cc966806612cc7169bffe7", size = 349321, upload-time = "2026-04-24T15:22:05.876Z" },
 ]
 
 [[package]]

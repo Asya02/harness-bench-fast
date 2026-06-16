@@ -18,10 +18,13 @@ defaults to operating on its own cwd.
 
 from __future__ import annotations
 
+import gc
+import json
 import os
 import re
 import shlex
 import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -32,9 +35,14 @@ from tempfile import TemporaryDirectory, mkdtemp
 from harness_bench.core import Task
 from harness_bench.runner import (
     TaskRun,
+    _add_usage_counts,
     _load_env_from_dotenv,
+    _mark_attempt,
     _one_line_detail,
+    _task_attempt_label,
+    _task_attempt_label_for,
     _task_sort_key,
+    _write_partial_results_json,
     summarize,
 )
 from harness_bench.tasks import ALL_TASKS, get_task
@@ -88,6 +96,220 @@ schedule waits for the IP to be unblocked before the next attempt.
 _TOKEN_LOCK = threading.Lock()
 _TOKEN_CACHE: dict[str, tuple[str, float]] = {}
 """Per-token-URL cache of (access_token, expires_at_unix_seconds)."""
+
+_CLEANUP_RETRY_DELAYS = (0.1, 0.25, 0.5, 1.0, 2.0)
+"""Short retry window for Windows temp-dir cleanup races / stale handles."""
+
+_PROCESS_TREE_SHUTDOWN_TIMEOUT = 10
+"""Seconds to wait for pipes to close after killing a timed-out CLI tree."""
+
+
+def _is_codex_exec_command(argv: list[str]) -> bool:
+    """Return whether argv launches `codex exec` or its short alias."""
+    if not argv:
+        return False
+    executable = Path(argv[0]).name
+    return executable == "codex" and len(argv) > 1 and argv[1] in ("exec", "e")
+
+
+def _ensure_codex_json_events(argv: list[str]) -> list[str]:
+    """Ask Codex exec for JSONL events so runner metrics can count steps."""
+    if not _is_codex_exec_command(argv) or "--json" in argv:
+        return argv
+    return [*argv[:2], "--json", *argv[2:]]
+
+
+def _codex_json_event_stats(stdout: str) -> dict[str, int] | None:
+    """Count Codex JSONL action events emitted by `codex exec --json`.
+
+    `agent_steps` counts completed non-message action items, which maps to
+    concrete actions such as file edits and shell commands rather than prose
+    messages. The raw event count is kept separately for audit/debugging.
+    """
+    events = 0
+    steps = 0
+    tool_calls = 0
+    shell_commands = 0
+    input_tokens = 0
+    output_tokens = 0
+    total_tokens = 0
+    saw_codex_event = False
+
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict) or not isinstance(payload.get("type"), str):
+            continue
+        saw_codex_event = True
+        events += 1
+        if payload["type"] == "turn.completed":
+            usage_stats: dict[str, int] = {}
+            _add_usage_counts(usage_stats, payload.get("usage"))
+            input_tokens += usage_stats.get("agent_input_tokens", 0)
+            output_tokens += usage_stats.get("agent_output_tokens", 0)
+            total_tokens += usage_stats.get("agent_total_tokens", 0)
+            continue
+        if payload["type"] != "item.completed":
+            continue
+        item = payload.get("item")
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type == "agent_message":
+            continue
+        steps += 1
+        if item_type == "command_execution":
+            shell_commands += 1
+        else:
+            tool_calls += 1
+
+    if not saw_codex_event:
+        return None
+    result = {
+        "agent_steps": steps,
+        "agent_tool_calls": tool_calls,
+        "agent_shell_commands": shell_commands,
+        "agent_events": events,
+    }
+    if input_tokens:
+        result["agent_input_tokens"] = input_tokens
+    if output_tokens:
+        result["agent_output_tokens"] = output_tokens
+    if total_tokens:
+        result["agent_total_tokens"] = total_tokens
+    return result
+
+
+def _task_run_with_cli_stats(
+    *,
+    task_id: str,
+    passed: bool,
+    message: str,
+    elapsed_seconds: float,
+    result: subprocess.CompletedProcess[str] | None,
+    error: str | None = None,
+    workspace: Path | None = None,
+) -> TaskRun:
+    stats = _codex_json_event_stats(result.stdout or "") if result is not None else None
+    return TaskRun(
+        task_id=task_id,
+        passed=passed,
+        message=message,
+        elapsed_seconds=elapsed_seconds,
+        error=error,
+        workspace=workspace,
+        **(stats or {}),
+    )
+
+
+def _terminate_process_tree(proc: subprocess.Popen[str]) -> None:
+    """Terminate a CLI process and its children without changing the CLI command.
+
+    ``run-cli`` often launches Windows agents through ``cmd /c`` because the
+    real executable can be a ``.cmd`` wrapper. Killing only that immediate
+    ``cmd.exe`` leaves the actual agent process alive with inherited stdout /
+    stderr handles, so ``communicate()`` can block long after the configured
+    per-task timeout. On Windows, ``taskkill /T`` kills the whole tree rooted at
+    the wrapper process. On POSIX, start a new process group and terminate that
+    group.
+    """
+    if os.name == "nt":
+        subprocess.run(  # noqa: S603,S607 — Windows process-tree cleanup helper
+            ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        return
+
+    try:
+        os.killpg(proc.pid, 15)
+    except ProcessLookupError:
+        return
+    except OSError:
+        proc.kill()
+
+
+def _run_cli_subprocess(
+    argv: list[str],
+    *,
+    cwd: Path,
+    timeout: int,
+    env: dict[str, str] | None,
+) -> subprocess.CompletedProcess[str]:
+    """Run the CLI command with a hard per-task process-tree timeout."""
+    creationflags = 0
+    start_new_session = False
+    if os.name == "nt":
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        start_new_session = True
+
+    proc = subprocess.Popen(  # noqa: S603 — trusted local benchmark command
+        argv,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+        creationflags=creationflags,
+        start_new_session=start_new_session,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _terminate_process_tree(proc)
+        try:
+            proc.communicate(timeout=_PROCESS_TREE_SHUTDOWN_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+        raise
+    return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
+
+
+def _cleanup_workspace_keepalive(
+    workspace_keepalive: TemporaryDirectory[str],
+    *,
+    task_id: str,
+) -> Path | None:
+    """Best-effort cleanup of a per-task temp workspace.
+
+    On Windows, a CLI agent or shell child can keep a file handle/cwd inside the
+    workspace for a moment after ``subprocess.run`` returns. ``TemporaryDirectory``
+    then raises ``OSError: [WinError 145] The directory is not empty`` and used
+    to abort the whole benchmark run after an otherwise completed task. Retry a
+    few times, then leave the workspace behind with a warning instead of turning
+    cleanup into a harness crash.
+    """
+    workspace = Path(workspace_keepalive.name)
+    last_exc: OSError | None = None
+    for attempt, delay in enumerate((0.0, *_CLEANUP_RETRY_DELAYS), start=1):
+        if delay:
+            gc.collect()
+            time.sleep(delay)
+        try:
+            workspace_keepalive.cleanup()
+            return None
+        except OSError as exc:
+            last_exc = exc
+            if attempt <= len(_CLEANUP_RETRY_DELAYS):
+                continue
+
+    print(
+        f"[WARN] cleanup failed for {task_id} workspace {workspace}: {last_exc}; "
+        "leaving it for inspection",
+        file=sys.stderr,
+    )
+    return workspace
 
 
 def _get_gigachat_access_token() -> str | None:
@@ -254,7 +476,7 @@ def run_task_cli(
     """
     _load_env_from_dotenv()
     workspace_keepalive: TemporaryDirectory | None = None
-    base_argv = shlex.split(cli_command)
+    base_argv = _ensure_codex_json_events(shlex.split(cli_command))
     last_result: subprocess.CompletedProcess[str] | None = None
     last_transient_excerpt: str | None = None
     started = time.monotonic()
@@ -294,15 +516,10 @@ def run_task_cli(
             argv += [task.prompt]
 
             try:
-                last_result = subprocess.run(  # noqa: S603 — trusted local benchmark
+                last_result = _run_cli_subprocess(
                     argv,
                     cwd=workspace_path,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
                     timeout=timeout,
-                    check=False,
-                    stdin=subprocess.DEVNULL,
                     env=_subprocess_env_with_token(),
                 )
             except subprocess.TimeoutExpired:
@@ -335,11 +552,12 @@ def run_task_cli(
 
             outcome = task.verify(workspace_path)
             if outcome.passed:
-                return TaskRun(
+                return _task_run_with_cli_stats(
                     task_id=task.id,
                     passed=True,
                     message=outcome.message,
                     elapsed_seconds=time.monotonic() - started,
+                    result=last_result,
                     workspace=workspace_path if keep_workspace else None,
                 )
 
@@ -356,7 +574,7 @@ def run_task_cli(
                 # — long enough to outlive multi-minute IP throttles on the
                 # IFT endpoint.
                 if workspace_keepalive is not None:
-                    workspace_keepalive.cleanup()
+                    _cleanup_workspace_keepalive(workspace_keepalive, task_id=task.id)
                     workspace_keepalive = None
                 delay = _BACKOFF_SCHEDULE[min(attempt, len(_BACKOFF_SCHEDULE) - 1)]
                 time.sleep(delay)
@@ -391,7 +609,7 @@ def run_task_cli(
                     ) + [task.prompt]
                     # Clean prior workspace and re-set up for PROM attempt.
                     if workspace_keepalive is not None:
-                        workspace_keepalive.cleanup()
+                        _cleanup_workspace_keepalive(workspace_keepalive, task_id=task.id)
                         workspace_keepalive = None
                     if keep_workspace:
                         workspace_path = Path(mkdtemp(prefix=f"hb_cli_prom_{task.id}_"))
@@ -402,15 +620,10 @@ def run_task_cli(
                         workspace_path = Path(workspace_keepalive.name)
                     task.setup(workspace_path)
                     try:
-                        prom_result = subprocess.run(  # noqa: S603
+                        prom_result = _run_cli_subprocess(
                             prom_argv,
                             cwd=workspace_path,
-                            capture_output=True,
-                            text=True,
-                            encoding="utf-8",
                             timeout=timeout,
-                            check=False,
-                            stdin=subprocess.DEVNULL,
                             env=prom_env,
                         )
                     except subprocess.TimeoutExpired:
@@ -421,21 +634,23 @@ def run_task_cli(
                         prom_outcome = task.verify(workspace_path)
                         prom_tag = f" [PROM-fallback model={prom_model}]"
                         if prom_outcome.passed:
-                            return TaskRun(
+                            return _task_run_with_cli_stats(
                                 task_id=task.id,
                                 passed=True,
                                 message=prom_outcome.message + prom_tag,
                                 elapsed_seconds=time.monotonic() - started,
+                                result=prom_result,
                                 workspace=workspace_path if keep_workspace else None,
                             )
                         # PROM-fallback also failed — surface its message for visibility.
                         message = f"{message} | PROM-fallback({prom_model}): {prom_outcome.message}"
 
-            return TaskRun(
+            return _task_run_with_cli_stats(
                 task_id=task.id,
                 passed=False,
                 message=message,
                 elapsed_seconds=time.monotonic() - started,
+                result=last_result,
                 workspace=workspace_path if keep_workspace else None,
             )
 
@@ -444,7 +659,7 @@ def run_task_cli(
         raise RuntimeError("run_task_cli retry loop fell through")
     finally:
         if workspace_keepalive is not None:
-            workspace_keepalive.cleanup()
+            _cleanup_workspace_keepalive(workspace_keepalive, task_id=task.id)
 
 
 def run_all_cli(
@@ -454,31 +669,40 @@ def run_all_cli(
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
     keep_workspace: bool = False,
     concurrency: int = 1,
+    attempts: int = 1,
+    json_output: str | Path | None = None,
 ) -> list[TaskRun]:
     """Run a subset (or all) of the benchmark via the CLI agent."""
     _load_env_from_dotenv()
+    if attempts < 1:
+        raise ValueError("attempts must be positive")
+
     targets = [get_task(tid) for tid in task_ids] if task_ids else list(ALL_TASKS)
 
     if concurrency <= 1:
         results: list[TaskRun] = []
         for task in targets:
-            print(f"→ {task.id}: {task.name}")
-            run = run_task_cli(
-                task,
-                cli_command=cli_command,
-                timeout=timeout,
-                keep_workspace=keep_workspace,
-            )
-            results.append(run)
-            status = "PASS" if run.passed else "FAIL"
-            print(f"  [{status}] {run.elapsed_seconds:5.1f}s — {_one_line_detail(run)}")
-            if keep_workspace and run.workspace:
-                print(f"  workspace: {run.workspace}")
+            for attempt in range(1, attempts + 1):
+                label = _task_attempt_label_for(task.id, attempt, attempts)
+                print(f"[START] {label}: {task.name}")
+                run = run_task_cli(
+                    task,
+                    cli_command=cli_command,
+                    timeout=timeout,
+                    keep_workspace=keep_workspace,
+                )
+                run = _mark_attempt(run, attempt, attempts)
+                results.append(run)
+                _write_partial_results_json(results, json_output)
+                status = "PASS" if run.passed else "FAIL"
+                print(f"  [{status}] {run.elapsed_seconds:5.1f}s — {_one_line_detail(run)}")
+                if keep_workspace and run.workspace:
+                    print(f"  workspace: {run.workspace}")
         return results
 
     print_lock = threading.Lock()
     completed = 0
-    total = len(targets)
+    total = len(targets) * attempts
     results = []
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         future_to_task = {
@@ -488,22 +712,27 @@ def run_all_cli(
                 cli_command=cli_command,
                 timeout=timeout,
                 keep_workspace=keep_workspace,
-            ): task
+            ): (task, attempt)
             for task in targets
+            for attempt in range(1, attempts + 1)
         }
         for future in as_completed(future_to_task):
-            run = future.result()
+            _task, attempt = future_to_task[future]
+            run = _mark_attempt(future.result(), attempt, attempts)
             results.append(run)
+            _write_partial_results_json(results, json_output)
             with print_lock:
                 completed += 1
                 status = "PASS" if run.passed else "FAIL"
                 print(
-                    f"[{completed:3d}/{total}] [{status}] {run.task_id:36s} "
+                    f"[{completed:3d}/{total}] [{status}] "
+                    f"{_task_attempt_label(run):40s} "
                     f"{run.elapsed_seconds:5.1f}s — {_one_line_detail(run)}"
                 )
                 if keep_workspace and run.workspace:
                     print(f"           workspace: {run.workspace}")
-    results.sort(key=lambda r: _task_sort_key(r.task_id))
+    results.sort(key=lambda r: (*_task_sort_key(r.task_id), r.attempt))
+    _write_partial_results_json(results, json_output)
     return results
 
 

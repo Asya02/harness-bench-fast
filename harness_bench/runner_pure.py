@@ -5,18 +5,26 @@ from __future__ import annotations
 import os
 import threading
 import time
-import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
 from harness_bench.core import Task
 from harness_bench.runner import (
+    AgentRunStatsCollector,
     TaskRun,
+    _agent_exception_task_run,
     _load_env_from_dotenv,
+    _mark_attempt,
     _one_line_detail,
+    _task_attempt_label,
+    _task_attempt_label_for,
+    _task_run_with_agent_stats,
     _task_sort_key,
+    _write_partial_results_json,
+    invoke_agent_with_stats,
 )
 from harness_bench.tasks import ALL_TASKS, get_task
 
@@ -55,8 +63,12 @@ def build_agent(workspace: Path, *, recursion_limit: int = 80) -> Any:
     )
     model = ProfilelessGigaChat(
         model=os.getenv("GIGACHAT_MODEL", "GigaChat-3-Ultra"),
-        base_url=os.getenv("GIGACHAT_BASE_URL", "https://gigachat.sberdevices.ru/v1"),
-        verify_ssl_certs=False,
+        # Let gigachat-sdk use its current default base URL unless the caller
+        # explicitly overrides it. Hard-coding the old IFT URL here breaks
+        # CORP/PERS credentials that expect the SDK default endpoint.
+        base_url=os.getenv("GIGACHAT_BASE_URL") or None,
+        verify_ssl_certs=os.getenv("GIGACHAT_VERIFY_SSL_CERTS", "false").lower()
+        not in ("false", "0", "no"),
         profanity_check=False,
         timeout=600,
         max_retries=20,
@@ -85,24 +97,30 @@ def run_task(
 
         task.setup(workspace_path)
         started = time.monotonic()
+        stats = AgentRunStatsCollector()
         try:
             agent = build_agent(workspace_path, recursion_limit=recursion_limit)
-            agent.invoke({"messages": [{"role": "user", "content": task.prompt}]})
-        except Exception:
-            return TaskRun(
+            invocation_result = invoke_agent_with_stats(
+                agent,
+                {"messages": [{"role": "user", "content": task.prompt}]},
+                stats,
+            )
+        except Exception as exc:  # noqa: BLE001 — log and surface as task failure
+            run = _agent_exception_task_run(
+                exc,
                 task_id=task.id,
-                passed=False,
-                message="",
                 elapsed_seconds=time.monotonic() - started,
-                error=traceback.format_exc(),
+                recursion_limit=recursion_limit,
                 workspace=workspace_path if keep_workspace else None,
             )
+            return replace(run, **stats.merged())
         result = task.verify(workspace_path)
-        return TaskRun(
+        return _task_run_with_agent_stats(
             task_id=task.id,
             passed=result.passed,
             message=result.message,
             elapsed_seconds=time.monotonic() - started,
+            stats=stats.merged(invocation_result),
             workspace=workspace_path if keep_workspace else None,
         )
     finally:
@@ -116,27 +134,40 @@ def run_all(
     keep_workspace: bool = False,
     recursion_limit: int = 80,
     concurrency: int = 1,
+    attempts: int = 1,
+    json_output: str | Path | None = None,
 ) -> list[TaskRun]:
     _load_env_from_dotenv()
     _ensure_credentials()
+
+    if attempts < 1:
+        raise ValueError("attempts must be positive")
 
     targets = [get_task(tid) for tid in task_ids] if task_ids else list(ALL_TASKS)
 
     if concurrency <= 1:
         results: list[TaskRun] = []
         for task in targets:
-            print(f"→ {task.id}: {task.name}")
-            run = run_task(task, keep_workspace=keep_workspace, recursion_limit=recursion_limit)
-            results.append(run)
-            status = "PASS" if run.passed else "FAIL"
-            print(f"  [{status}] {run.elapsed_seconds:5.1f}s — {_one_line_detail(run)}")
-            if keep_workspace and run.workspace:
-                print(f"  workspace: {run.workspace}")
+            for attempt in range(1, attempts + 1):
+                label = _task_attempt_label_for(task.id, attempt, attempts)
+                print(f"[START] {label}: {task.name}")
+                run = run_task(
+                    task,
+                    keep_workspace=keep_workspace,
+                    recursion_limit=recursion_limit,
+                )
+                run = _mark_attempt(run, attempt, attempts)
+                results.append(run)
+                _write_partial_results_json(results, json_output)
+                status = "PASS" if run.passed else "FAIL"
+                print(f"  [{status}] {run.elapsed_seconds:5.1f}s — {_one_line_detail(run)}")
+                if keep_workspace and run.workspace:
+                    print(f"  workspace: {run.workspace}")
         return results
 
     print_lock = threading.Lock()
     completed = 0
-    total = len(targets)
+    total = len(targets) * attempts
     results = []
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         future_to_task = {
@@ -145,20 +176,25 @@ def run_all(
                 task,
                 keep_workspace=keep_workspace,
                 recursion_limit=recursion_limit,
-            ): task
+            ): (task, attempt)
             for task in targets
+            for attempt in range(1, attempts + 1)
         }
         for future in as_completed(future_to_task):
-            run = future.result()
+            _task, attempt = future_to_task[future]
+            run = _mark_attempt(future.result(), attempt, attempts)
             results.append(run)
+            _write_partial_results_json(results, json_output)
             with print_lock:
                 completed += 1
                 status = "PASS" if run.passed else "FAIL"
                 print(
-                    f"[{completed:3d}/{total}] [{status}] {run.task_id:32s} "
+                    f"[{completed:3d}/{total}] [{status}] "
+                    f"{_task_attempt_label(run):40s} "
                     f"{run.elapsed_seconds:5.1f}s — {_one_line_detail(run)}"
                 )
                 if keep_workspace and run.workspace:
                     print(f"           workspace: {run.workspace}")
-    results.sort(key=lambda r: _task_sort_key(r.task_id))
+    results.sort(key=lambda r: (*_task_sort_key(r.task_id), r.attempt))
+    _write_partial_results_json(results, json_output)
     return results

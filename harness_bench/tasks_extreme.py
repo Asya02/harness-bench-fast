@@ -20,6 +20,7 @@ import gzip
 import io
 import json
 import math
+import re
 import shutil
 import sqlite3
 import statistics
@@ -1927,8 +1928,11 @@ _DEAD_FUNCS = {"never_called", "also_dead"}
 
 
 def _verify_task_187(ws: Path) -> VerifyResult:
-    p = ws / "dead.txt"
-    if not p.exists():
+    p = next(
+        (candidate for candidate in (ws / "dead.txt", ws / "code" / "dead.txt") if candidate.exists()),
+        None,
+    )
+    if p is None:
         return VerifyResult(False, "dead.txt missing")
     raw = {line.strip() for line in p.read_text().splitlines() if line.strip()}
     if raw == _DEAD_FUNCS:
@@ -2051,6 +2055,22 @@ _CONCAT_ROWS = sorted(
     {(1, "Alice"), (2, "Bob"), (3, "Carol"), (4, "Dave"), (5, "Eve"), (6, "Frank")}
 )
 _CONCAT_GOLD = "id,name\n" + "".join(f"{i},{n}\n" for i, n in _CONCAT_ROWS)
+
+
+def _verify_task_190(ws: Path) -> VerifyResult:
+    p = next(
+        (candidate for candidate in (ws / "merged.csv", ws / "data" / "merged.csv") if candidate.exists()),
+        None,
+    )
+    if p is None:
+        return VerifyResult(False, "merged.csv missing")
+    actual = p.read_text(encoding="utf-8").replace("\r\n", "\n").strip()
+    expected = _CONCAT_GOLD.strip()
+    if actual == expected:
+        return VerifyResult(True, "merged.csv matches expected content")
+    return VerifyResult(False, f"merged.csv content differs\nExpected: {expected!r}\nActual:   {actual!r}")
+
+
 TASK_190 = Task(
     id="task_190_concat_dedupe_sort",
     name="Concat 3 CSVs, dedupe, sort by id",
@@ -2064,7 +2084,7 @@ TASK_190 = Task(
     ),
     setup_files=_CSVS_190,
     gold_files={"merged.csv": _CONCAT_GOLD},
-    verifier=file_text_equals("merged.csv", _CONCAT_GOLD),
+    verifier=_verify_task_190,
 )
 
 
@@ -2726,6 +2746,47 @@ _REPORT_203_GOLD = (
     "\n"
     "TOTAL_OPEN=3\n"
 )
+_REPORT_203_ROWS = [
+    ("alpha", "1", "2", "8"),
+    ("beta", "2", "1", "2"),
+    ("gamma", "0", "2", "8"),
+]
+
+
+def _verify_task_203(ws: Path) -> VerifyResult:
+    p = ws / "team_report.md"
+    if not p.exists():
+        return VerifyResult(False, "team_report.md missing")
+    text = p.read_text(encoding="utf-8")
+    blocks = text.strip().split("\n\n")
+    if len(blocks) != 2:
+        return VerifyResult(False, "team_report.md should contain a table, blank line, then TOTAL_OPEN")
+
+    table_lines = [line.strip() for line in blocks[0].splitlines() if line.strip()]
+    if len(table_lines) != 5:
+        return VerifyResult(False, f"team_report.md table should have 5 lines, got {len(table_lines)}")
+
+    def _cells(line: str) -> list[str]:
+        return [cell.strip() for cell in line.strip().strip("|").split("|")]
+
+    header = _cells(table_lines[0])
+    if header != ["team", "open", "closed", "closed_hours"]:
+        return VerifyResult(False, f"team_report.md header {header!r} differs from expected")
+
+    separators = _cells(table_lines[1])
+    if len(separators) != 4 or any(not re.fullmatch(r":?-{3,}:?", cell) for cell in separators):
+        return VerifyResult(False, f"team_report.md separator row {separators!r} is not valid markdown")
+
+    rows = [_cells(line) for line in table_lines[2:]]
+    expected_rows = [list(row) for row in _REPORT_203_ROWS]
+    if rows != expected_rows:
+        return VerifyResult(False, f"team_report.md rows {rows!r} differ from {expected_rows!r}")
+
+    if blocks[1].strip() != "TOTAL_OPEN=3":
+        return VerifyResult(False, f"team_report.md total line {blocks[1].strip()!r} differs from expected")
+    return VerifyResult(True, "team_report.md matches expected report")
+
+
 TASK_203 = Task(
     id="task_203_sqlite_team_markdown_report",
     name="Build markdown KPI report from support.db tickets",
@@ -2743,7 +2804,7 @@ TASK_203 = Task(
     setup_files={},
     setup_callback=_sqlite_203_setup,
     gold_files={"team_report.md": _REPORT_203_GOLD},
-    verifier=file_text_equals("team_report.md", _REPORT_203_GOLD),
+    verifier=_verify_task_203,
 )
 
 

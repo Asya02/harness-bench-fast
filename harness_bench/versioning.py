@@ -62,6 +62,82 @@ TASK_SET_REVISIONS: tuple[TaskSetRevision, ...] = (
         modules=("tasks_memory.py",),
         notes="Added memory-discipline tasks using AGENTS.md and MEMORY.md.",
     ),
+    TaskSetRevision(
+        version="0.4.0",
+        introduced="2026-06-02",
+        total_tasks=253,
+        added_task_numbers=(232, 253),
+        modules=("tasks_memory.py",),
+        notes=(
+            "Extended the memory suite: knowledge update / contradiction "
+            "resolution, temporal reasoning, abstention, preference-following, "
+            "multi-hop and multi-session reasoning, information extraction."
+        ),
+    ),
+    TaskSetRevision(
+        version="0.5.0",
+        introduced="2026-06-02",
+        total_tasks=262,
+        added_task_numbers=(254, 262),
+        modules=("tasks_agentic.py",),
+        notes=(
+            "Added synthetic Terminal-Bench-like, tau-like, and "
+            "SWE-bench-like agentic tasks."
+        ),
+    ),
+    TaskSetRevision(
+        version="0.6.0",
+        introduced="2026-06-02",
+        total_tasks=283,
+        added_task_numbers=(263, 283),
+        modules=("tasks_agentic.py",),
+        notes=(
+            "Expanded the agentic wave to 10 Terminal-Bench-like, "
+            "10 tau-like, and 10 SWE-bench-like tasks."
+        ),
+    ),
+    TaskSetRevision(
+        version="0.7.0",
+        introduced="2026-06-02",
+        total_tasks=298,
+        added_task_numbers=(284, 298),
+        modules=("tasks_agentic.py",),
+        notes=(
+            "Expanded the agentic wave to 15 Terminal-Bench-like, "
+            "15 tau-like, and 15 SWE-bench-like tasks."
+        ),
+    ),
+    TaskSetRevision(
+        version="0.8.0",
+        introduced="2026-06-05",
+        total_tasks=308,
+        added_task_numbers=(299, 308),
+        modules=("tasks_vcs.py",),
+        notes=(
+            "Added version-control tasks: Git merge-conflict resolution "
+            "(ours/theirs/both/manual, diff3 base sections, multi-hunk, "
+            "multi-file), multi-hunk unified-diff apply/revert, and "
+            "unresolved-conflict detection with false-positive traps. Strict "
+            "exact-content verifiers catch dropped markers and stray "
+            "special characters."
+        ),
+    ),
+    TaskSetRevision(
+        version="0.9.0",
+        introduced="2026-06-05",
+        total_tasks=313,
+        added_task_numbers=(309, 313),
+        modules=("tasks_vcs.py",),
+        notes=(
+            "Added five multi-file / multi-step version-control workflows that "
+            "stress step-budget and cross-file propagation: scale rename "
+            "refactor across twelve conflicted call sites, module split into a "
+            "package, an ordered nine-patch stack across four files plus a "
+            "synthesised summary, policy-manifest-driven resolution of sixteen "
+            "modules, and precedence deep-merge of five config fragments. All "
+            "frontier-solvable (Opus 4.8 and GPT-5.5 pass); gold verified."
+        ),
+    ),
 )
 
 CURRENT_TASK_SET_REVISION = TASK_SET_REVISIONS[-1]

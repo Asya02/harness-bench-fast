@@ -7,13 +7,50 @@ import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
 from harness_bench.core import Task, VerifyResult
+from harness_bench.metrics import PassMetric, compute_pass_metrics
 from harness_bench.tasks import ALL_TASKS, get_task
+
+
+def _is_graph_recursion_error(exc: BaseException) -> bool:
+    """Return True when ``exc`` is LangGraph's recursion-limit failure."""
+    try:
+        from langgraph.errors import GraphRecursionError
+    except ImportError:  # pragma: no cover - langgraph is an indirect runtime dep.
+        return exc.__class__.__name__ == "GraphRecursionError"
+    return isinstance(exc, GraphRecursionError)
+
+
+def _agent_exception_task_run(
+    exc: BaseException,
+    *,
+    task_id: str,
+    elapsed_seconds: float,
+    recursion_limit: int,
+    workspace: Path | None,
+) -> TaskRun:
+    """Convert an agent/runtime exception into a normal task failure."""
+    if _is_graph_recursion_error(exc):
+        return TaskRun(
+            task_id=task_id,
+            passed=False,
+            message=f"graph recursion limit reached after {recursion_limit} steps",
+            elapsed_seconds=elapsed_seconds,
+            workspace=workspace,
+        )
+    return TaskRun(
+        task_id=task_id,
+        passed=False,
+        message="",
+        elapsed_seconds=elapsed_seconds,
+        error=traceback.format_exc(),
+        workspace=workspace,
+    )
 
 
 @dataclass
@@ -26,6 +63,16 @@ class TaskRun:
     elapsed_seconds: float
     error: str | None = None
     workspace: Path | None = None
+    attempt: int = 1
+    attempts: int = 1
+    agent_steps: int | None = None
+    agent_tool_calls: int | None = None
+    agent_shell_commands: int | None = None
+    agent_events: int | None = None
+    agent_llm_calls: int | None = None
+    agent_input_tokens: int | None = None
+    agent_output_tokens: int | None = None
+    agent_total_tokens: int | None = None
 
 
 def _load_env_from_dotenv() -> None:
@@ -39,6 +86,203 @@ def _load_env_from_dotenv() -> None:
     env_path = repo_root / ".env"
     if env_path.exists():
         load_dotenv(env_path, override=False)
+
+
+def _coerce_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return None
+
+
+def _usage_token_counts(usage: Any) -> tuple[int | None, int | None, int | None]:
+    if not isinstance(usage, dict):
+        return None, None, None
+
+    input_tokens = (
+        _coerce_int(usage.get("input_tokens"))
+        or _coerce_int(usage.get("prompt_tokens"))
+        or _coerce_int(usage.get("prompt_eval_count"))
+    )
+    output_tokens = (
+        _coerce_int(usage.get("output_tokens"))
+        or _coerce_int(usage.get("completion_tokens"))
+        or _coerce_int(usage.get("eval_count"))
+    )
+    total_tokens = _coerce_int(usage.get("total_tokens"))
+    if total_tokens is None and (input_tokens is not None or output_tokens is not None):
+        total_tokens = (input_tokens or 0) + (output_tokens or 0)
+    return input_tokens, output_tokens, total_tokens
+
+
+def _add_usage_counts(stats: dict[str, int], usage: Any) -> None:
+    input_tokens, output_tokens, total_tokens = _usage_token_counts(usage)
+    if input_tokens is not None:
+        stats["agent_input_tokens"] = stats.get("agent_input_tokens", 0) + input_tokens
+    if output_tokens is not None:
+        stats["agent_output_tokens"] = stats.get("agent_output_tokens", 0) + output_tokens
+    if total_tokens is not None:
+        stats["agent_total_tokens"] = stats.get("agent_total_tokens", 0) + total_tokens
+
+
+def _message_role(message: Any) -> str | None:
+    role = getattr(message, "type", None) or getattr(message, "role", None)
+    if isinstance(message, dict):
+        role = message.get("type") or message.get("role")
+    return role if isinstance(role, str) else None
+
+
+def _message_tool_calls(message: Any) -> list[Any]:
+    tool_calls = getattr(message, "tool_calls", None)
+    if isinstance(message, dict):
+        tool_calls = message.get("tool_calls", tool_calls)
+    return tool_calls if isinstance(tool_calls, list) else []
+
+
+def _tool_call_name(tool_call: Any) -> str:
+    if isinstance(tool_call, dict):
+        name = tool_call.get("name") or tool_call.get("function", {}).get("name")
+        return name if isinstance(name, str) else ""
+    name = getattr(tool_call, "name", "")
+    return name if isinstance(name, str) else ""
+
+
+def _message_usage(message: Any) -> list[Any]:
+    usages: list[Any] = []
+    usage_metadata = getattr(message, "usage_metadata", None)
+    if isinstance(message, dict):
+        usage_metadata = message.get("usage_metadata", usage_metadata)
+    if usage_metadata:
+        usages.append(usage_metadata)
+
+    response_metadata = getattr(message, "response_metadata", None)
+    if isinstance(message, dict):
+        response_metadata = message.get("response_metadata", response_metadata)
+    if isinstance(response_metadata, dict):
+        for key in ("token_usage", "usage", "usage_metadata"):
+            if response_metadata.get(key):
+                usages.append(response_metadata[key])
+    return usages
+
+
+def agent_stats_from_result(invocation_result: Any) -> dict[str, int]:
+    """Best-effort step/token extraction from a LangGraph/deepagents result."""
+    stats: dict[str, int] = {}
+    if not isinstance(invocation_result, dict):
+        return stats
+
+    messages = invocation_result.get("messages")
+    if not isinstance(messages, list):
+        return stats
+
+    events = len(messages)
+    steps = 0
+    tool_calls = 0
+    shell_commands = 0
+    llm_calls = 0
+    for message in messages:
+        role = _message_role(message)
+        if role not in ("human", "user", "system"):
+            steps += 1
+        calls = _message_tool_calls(message)
+        if calls:
+            tool_calls += len(calls)
+            llm_calls += 1
+            for call in calls:
+                if _tool_call_name(call) == "execute":
+                    shell_commands += 1
+        elif role in ("ai", "assistant"):
+            llm_calls += 1
+        for usage in _message_usage(message):
+            _add_usage_counts(stats, usage)
+
+    stats["agent_events"] = events
+    stats["agent_steps"] = steps
+    stats["agent_tool_calls"] = tool_calls
+    stats["agent_shell_commands"] = shell_commands
+    stats["agent_llm_calls"] = llm_calls
+    return stats
+
+
+class AgentRunStatsCollector:
+    """LangChain callback collector for token usage emitted during agent runs."""
+
+    def __init__(self) -> None:
+        self.stats: dict[str, int] = {}
+
+    def as_callback(self) -> Any:
+        try:
+            from langchain_core.callbacks import BaseCallbackHandler
+        except ImportError:
+            return None
+
+        outer = self
+
+        class _Handler(BaseCallbackHandler):
+            def on_llm_end(self, response: Any, **_kwargs: Any) -> None:
+                outer.stats["agent_llm_calls"] = outer.stats.get("agent_llm_calls", 0) + 1
+                llm_output = getattr(response, "llm_output", None)
+                if isinstance(llm_output, dict):
+                    _add_usage_counts(outer.stats, llm_output.get("token_usage"))
+                    _add_usage_counts(outer.stats, llm_output.get("usage"))
+                for generations in getattr(response, "generations", []) or []:
+                    for generation in generations:
+                        message = getattr(generation, "message", None)
+                        if message is not None:
+                            for usage in _message_usage(message):
+                                _add_usage_counts(outer.stats, usage)
+
+        return _Handler()
+
+    def merged(self, invocation_result: Any | None = None) -> dict[str, int]:
+        stats = dict(self.stats)
+        if invocation_result is not None:
+            for key, value in agent_stats_from_result(invocation_result).items():
+                if (
+                    key.startswith("agent_")
+                    and key.endswith("_tokens")
+                    or key == "agent_llm_calls"
+                ):
+                    stats[key] = max(stats.get(key, 0), value)
+                else:
+                    stats[key] = value
+        return stats
+
+
+def invoke_agent_with_stats(agent: Any, payload: dict[str, Any], stats: AgentRunStatsCollector) -> Any:
+    callbacks = [cb] if (cb := stats.as_callback()) is not None else None
+    if not callbacks:
+        return agent.invoke(payload)
+    try:
+        return agent.invoke(payload, config={"callbacks": callbacks})
+    except TypeError as exc:
+        if "config" not in str(exc):
+            raise
+        return agent.invoke(payload)
+
+
+def _task_run_with_agent_stats(
+    *,
+    task_id: str,
+    passed: bool,
+    message: str,
+    elapsed_seconds: float,
+    stats: dict[str, int] | None,
+    error: str | None = None,
+    workspace: Path | None = None,
+) -> TaskRun:
+    return TaskRun(
+        task_id=task_id,
+        passed=passed,
+        message=message,
+        elapsed_seconds=elapsed_seconds,
+        error=error,
+        workspace=workspace,
+        **(stats or {}),
+    )
 
 
 def build_agent(workspace: Path, *, recursion_limit: int = 80) -> Any:
@@ -69,8 +313,12 @@ def build_agent(workspace: Path, *, recursion_limit: int = 80) -> Any:
     )
     model = GigaChat(
         model=os.getenv("GIGACHAT_MODEL", "GigaChat-3-Ultra"),
-        base_url=os.getenv("GIGACHAT_BASE_URL", "https://gigachat.sberdevices.ru/v1"),
-        verify_ssl_certs=False,
+        # Let gigachat-sdk use its current default base URL unless the caller
+        # explicitly overrides it. Hard-coding the old IFT URL here breaks
+        # CORP/PERS credentials that expect the SDK default endpoint.
+        base_url=os.getenv("GIGACHAT_BASE_URL") or None,
+        verify_ssl_certs=os.getenv("GIGACHAT_VERIFY_SSL_CERTS", "false").lower()
+        not in ("false", "0", "no"),
         profanity_check=False,
         timeout=600,
         # Transient backend errors (403/429/5xx from IFT endpoint under
@@ -124,24 +372,30 @@ def run_task(
 
         task.setup(workspace_path)
         started = time.monotonic()
+        stats = AgentRunStatsCollector()
         try:
             agent = build_agent(workspace_path, recursion_limit=recursion_limit)
-            agent.invoke({"messages": [{"role": "user", "content": task.prompt}]})
-        except Exception:  # noqa: BLE001 — log and surface as failure
-            return TaskRun(
+            invocation_result = invoke_agent_with_stats(
+                agent,
+                {"messages": [{"role": "user", "content": task.prompt}]},
+                stats,
+            )
+        except Exception as exc:  # noqa: BLE001 — log and surface as task failure
+            run = _agent_exception_task_run(
+                exc,
                 task_id=task.id,
-                passed=False,
-                message="",
                 elapsed_seconds=time.monotonic() - started,
-                error=traceback.format_exc(),
+                recursion_limit=recursion_limit,
                 workspace=workspace_path if keep_workspace else None,
             )
+            return replace(run, **stats.merged())
         result = task.verify(workspace_path)
-        return TaskRun(
+        return _task_run_with_agent_stats(
             task_id=task.id,
             passed=result.passed,
             message=result.message,
             elapsed_seconds=time.monotonic() - started,
+            stats=stats.merged(invocation_result),
             workspace=workspace_path if keep_workspace else None,
         )
     finally:
@@ -155,11 +409,13 @@ def run_all(
     keep_workspace: bool = False,
     recursion_limit: int = 80,
     concurrency: int = 1,
+    attempts: int = 1,
+    json_output: str | Path | None = None,
 ) -> list[TaskRun]:
     """Run a subset (or all) of the benchmark tasks.
 
     When `concurrency == 1` (default) tasks run sequentially and progress is
-    printed in two lines per task (`→ task_id: name` then `[PASS] ...`).
+    printed in two lines per task (`[START] task_id: name` then `[PASS] ...`).
     When `concurrency > 1` tasks run in a `ThreadPoolExecutor` (each task is
     fully isolated in its own `TemporaryDirectory`, so no synchronization is
     required around the workspace); progress is printed as a single line per
@@ -169,23 +425,34 @@ def run_all(
     _load_env_from_dotenv()
     _ensure_credentials()
 
+    if attempts < 1:
+        raise ValueError("attempts must be positive")
+
     targets = [get_task(tid) for tid in task_ids] if task_ids else list(ALL_TASKS)
 
     if concurrency <= 1:
         results: list[TaskRun] = []
         for task in targets:
-            print(f"→ {task.id}: {task.name}")
-            run = run_task(task, keep_workspace=keep_workspace, recursion_limit=recursion_limit)
-            results.append(run)
-            status = "PASS" if run.passed else "FAIL"
-            print(f"  [{status}] {run.elapsed_seconds:5.1f}s — {_one_line_detail(run)}")
-            if keep_workspace and run.workspace:
-                print(f"  workspace: {run.workspace}")
+            for attempt in range(1, attempts + 1):
+                label = _task_attempt_label_for(task.id, attempt, attempts)
+                print(f"[START] {label}: {task.name}")
+                run = run_task(
+                    task,
+                    keep_workspace=keep_workspace,
+                    recursion_limit=recursion_limit,
+                )
+                run = _mark_attempt(run, attempt, attempts)
+                results.append(run)
+                _write_partial_results_json(results, json_output)
+                status = "PASS" if run.passed else "FAIL"
+                print(f"  [{status}] {run.elapsed_seconds:5.1f}s — {_one_line_detail(run)}")
+                if keep_workspace and run.workspace:
+                    print(f"  workspace: {run.workspace}")
         return results
 
     print_lock = threading.Lock()
     completed = 0
-    total = len(targets)
+    total = len(targets) * attempts
     results = []
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         future_to_task = {
@@ -194,22 +461,27 @@ def run_all(
                 task,
                 keep_workspace=keep_workspace,
                 recursion_limit=recursion_limit,
-            ): task
+            ): (task, attempt)
             for task in targets
+            for attempt in range(1, attempts + 1)
         }
         for future in as_completed(future_to_task):
-            run = future.result()
+            _task, attempt = future_to_task[future]
+            run = _mark_attempt(future.result(), attempt, attempts)
             results.append(run)
+            _write_partial_results_json(results, json_output)
             with print_lock:
                 completed += 1
                 status = "PASS" if run.passed else "FAIL"
                 print(
-                    f"[{completed:3d}/{total}] [{status}] {run.task_id:32s} "
+                    f"[{completed:3d}/{total}] [{status}] "
+                    f"{_task_attempt_label(run):40s} "
                     f"{run.elapsed_seconds:5.1f}s — {_one_line_detail(run)}"
                 )
                 if keep_workspace and run.workspace:
                     print(f"           workspace: {run.workspace}")
-    results.sort(key=lambda r: _task_sort_key(r.task_id))
+    results.sort(key=lambda r: (*_task_sort_key(r.task_id), r.attempt))
+    _write_partial_results_json(results, json_output)
     return results
 
 
@@ -243,20 +515,163 @@ def _one_line_detail(run: TaskRun) -> str:
     return "(no detail)"
 
 
-def summarize(results: list[TaskRun]) -> None:
+def _mark_attempt(run: TaskRun, attempt: int, attempts: int) -> TaskRun:
+    return replace(run, attempt=attempt, attempts=attempts)
+
+
+def _task_attempt_label_for(task_id: str, attempt: int, attempts: int) -> str:
+    if attempts == 1:
+        return task_id
+    return f"{task_id} #{attempt}/{attempts}"
+
+
+def _task_attempt_label(run: TaskRun) -> str:
+    return _task_attempt_label_for(run.task_id, run.attempt, run.attempts)
+
+
+def summarize(
+    results: list[TaskRun],
+    *,
+    pass_at_ks: tuple[int, ...] = (1,),
+    pass_hat_ks: tuple[int, ...] = (),
+) -> None:
     """Print a pass/fail summary block at the end of a run."""
     total = len(results)
     passed = sum(1 for r in results if r.passed)
     print()
     print("=" * 64)
-    print(f"Passed: {passed}/{total}")
+    label = "Passed" if all(r.attempts == 1 for r in results) else "Passed attempts"
+    print(f"{label}: {passed}/{total}")
+    metrics = compute_pass_metrics(results, pass_at_ks=pass_at_ks, pass_hat_ks=pass_hat_ks)
+    if metrics:
+        print()
+        print("Metrics:")
+        for line in _format_metrics_table(metrics):
+            print(f"  {line}")
     if passed < total:
         print()
         print("Failures:")
+        show_tracebacks = os.getenv("HARNESS_BENCH_SHOW_TRACEBACK", "").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
         for r in results:
             if r.passed:
                 continue
-            print(f"  - {r.task_id}: {_one_line_detail(r)}")
+            print(f"  - {_task_attempt_label(r)}: {_one_line_detail(r)}")
+            if show_tracebacks and r.error:
+                print("    Traceback:")
+                for line in r.error.rstrip().splitlines():
+                    print(f"      {line}")
+
+
+def _format_metrics_table(metrics: list[PassMetric]) -> list[str]:
+    metric_by_key = {(metric.kind, metric.k): metric for metric in metrics}
+    ks = sorted({metric.k for metric in metrics})
+    kinds = [kind for kind in ("pass@", "pass^") if any(m.kind == kind for m in metrics)]
+    headers = ["K", *(f"{kind}K" for kind in kinds)]
+    rows = [
+        [
+            str(k),
+            *[
+                _format_metric_value(metric_by_key.get((kind, k)))
+                for kind in kinds
+            ],
+        ]
+        for k in ks
+    ]
+    widths = [
+        max(len(row[i]) for row in [headers, *rows])
+        for i in range(len(headers))
+    ]
+    lines = [
+        _format_table_row(headers, widths),
+        _format_table_row(["-" * width for width in widths], widths),
+    ]
+    lines.extend(_format_table_row(row, widths) for row in rows)
+    return lines
+
+
+def _format_metric_value(metric: PassMetric | None) -> str:
+    if metric is None:
+        return "-"
+    task_equivalent = metric.value * metric.task_count
+    rounded = round(task_equivalent)
+    count = str(rounded) if abs(task_equivalent - rounded) < 1e-9 else f"{task_equivalent:.1f}"
+    return f"{count}/{metric.task_count}"
+
+
+def _format_table_row(values: list[str], widths: list[int]) -> str:
+    cells = [value.rjust(width) for value, width in zip(values, widths, strict=True)]
+    return "  ".join(cells)
+
+
+def results_to_payload(results: list[TaskRun]) -> dict[str, Any]:
+    """Build a JSON-serializable payload describing a benchmark run.
+
+    The payload carries an aggregate (``passed``/``total``/``pass_rate``) plus a
+    per-task breakdown including each task's free-form ``tags`` and numeric id,
+    so downstream tooling can compute per-category metrics without re-importing
+    the task registry.
+    """
+    from harness_bench.versioning import TASK_SET_VERSION, task_number
+
+    total = len(results)
+    passed = sum(1 for r in results if r.passed)
+    tasks_payload: list[dict[str, Any]] = []
+    for r in results:
+        try:
+            tags = list(get_task(r.task_id).tags)
+        except Exception:  # noqa: BLE001 — tags are best-effort metadata
+            tags = []
+        tasks_payload.append(
+            {
+                "task_id": r.task_id,
+                "number": task_number(r.task_id),
+                "passed": r.passed,
+                "message": r.message,
+                "elapsed_seconds": r.elapsed_seconds,
+                "error": r.error,
+                "tags": tags,
+                "attempt": r.attempt,
+                "attempts": r.attempts,
+                "agent_steps": r.agent_steps,
+                "agent_tool_calls": r.agent_tool_calls,
+                "agent_shell_commands": r.agent_shell_commands,
+                "agent_events": r.agent_events,
+                "agent_llm_calls": r.agent_llm_calls,
+                "agent_input_tokens": r.agent_input_tokens,
+                "agent_output_tokens": r.agent_output_tokens,
+                "agent_total_tokens": r.agent_total_tokens,
+            }
+        )
+    return {
+        "task_set_version": TASK_SET_VERSION,
+        "total": total,
+        "passed": passed,
+        "pass_rate": (passed / total) if total else 0.0,
+        "tasks": tasks_payload,
+    }
+
+
+def write_results_json(results: list[TaskRun], path: str | Path) -> None:
+    """Serialize a run's results to ``path`` as JSON (parents are created)."""
+    import json
+
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(
+        json.dumps(results_to_payload(results), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _write_partial_results_json(results: list[TaskRun], path: str | Path | None) -> None:
+    if path is None:
+        return
+    sorted_results = sorted(results, key=lambda r: (*_task_sort_key(r.task_id), r.attempt))
+    write_results_json(sorted_results, path)
 
 
 # ---------------------------------------------------------------------------

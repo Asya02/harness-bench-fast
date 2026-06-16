@@ -1,6 +1,36 @@
 # harness-bench
 
-A self-contained **231-task agent benchmark** (`task-set v0.3.0`) for evaluating LLM-backed
+## Current Results
+
+Current benchmark results use the 298-task set (`task-set v0.7.0`). Older
+task-set histories live in [`LEGACY_RESULTS.md`](LEGACY_RESULTS.md). `Steps`
+and `Tokens` are shown when the runner exposes them.
+
+Public landing page: <https://ai-forever.github.io/harness-bench-fast/>
+
+| Harness | Model | Result | % | Steps | Tokens |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Claude Code CLI | Claude Opus 4.8 | 298/298 | 100.0% | — | — |
+| Codex CLI | GPT-5.5 | 298/298 | 100.0% | — | — |
+| opencode | Qwen3.6-27B-FP8 (vLLM) | 291/298 | 97.7% | — | — |
+| free-code | Claude Haiku 4.5 | 284/298 | 95.3% | — | — |
+| deepagents + Anthropic profile | Claude Haiku 4.5 | 280/298 | 94.0% | 3,016 | 41,405,850 |
+| deepagents + Anthropic profile | Claude Sonnet 4.6 | 279/298 | 93.6% | 2,894 | 39,695,400 |
+| deepagents | Qwen 3.6 Flash | 277/298 | 93.0% | 3,132 | 35,108,655 |
+| deepagents | Qwen3.6-27B-FP8 (vLLM) | 274/298 | 91.9% | 3,028 | 33,645,093 |
+| deepagents | DeepSeek V4 Flash | 266/298 | 89.3% | 3,489 | 40,392,075 |
+| deepagents | Qwen 3.6 Plus | 265/298 | 88.9% | 3,288 | 37,687,035 |
+| Hermes CLI | Claude Sonnet 4.6 | 262/298 | 87.9% | — | — |
+| deepagents | GPT-4.1 Mini | 245/298 | 82.2% | 2,754 | 27,705,519 |
+| deepagents | Qwen 3.5 Flash | 241/298 | 80.9% | 2,677 | 30,564,414 |
+| deepagents + GigaChat profile | GigaChat-3-Ultra PROM | 231/298 | 77.5% | 1,466 | 9,307,062 |
+| deepagents | GLM 4.7 Flash | 231/298 | 77.5% | 3,019 | 34,373,385 |
+| pi-mono | GigaChat-3-Ultra PROM | 226/298 | 75.8% | — | — |
+| deepagents, no profile | GigaChat-3-Ultra PROM | 200/298 | 67.1% | 2,569 | 18,516,153 |
+| deepagents | GPT-OSS-120B | 167/298 | 56.0% | 1,756 | 18,889,569 |
+| deepagents | GPT-4.1 Nano | 149/298 | 50.0% | 2,372 | 30,104,298 |
+
+A self-contained **298-task agent benchmark** (`task-set v0.7.0`) for evaluating LLM-backed
 coding agents on file-operation work: create / edit / refactor source
 files, transform CSV / JSON / JSONL / XLSX, run pytest, search across a
 project tree, write and use `MEMORY.md` per repo conventions, and chain
@@ -37,7 +67,7 @@ uv venv && uv pip install -e ".[gigachat,openrouter]"
 # to the public profile.
 uv pip install -e ".[gigachat-profile]"
 
-# List all 231 tasks
+# List all 298 tasks
 uv run python -m harness_bench list
 
 # Show the benchmark task-set version and revision history
@@ -53,6 +83,22 @@ uv run python -m harness_bench run --concurrency 5
 uv run python -m harness_bench run-openrouter \
     --model deepseek/deepseek-v4-flash --concurrency 5
 
+# Internal OpenAI-compatible gateways can use password auth instead of a
+# static API key. The runner fetches and refreshes a bearer token without
+# printing it:
+# OPENROUTER_USE_INTERNAL_TAGME=1  # local shortcut for the ignored tagme example
+# OPENROUTER_BASE_URL=https://gateway.example/x/ai/llm/v1
+# OPENROUTER_AUTH_URL=https://gateway.example/auth/realms/.../token
+# OPENROUTER_AUTH_USERNAME=...
+# OPENROUTER_AUTH_PASSWORD=...
+# OPENROUTER_AUTH_CLIENT_ID=api
+# OPENROUTER_AUTH_VERIFY_TLS=false  # only for private gateways that need curl -k
+uv run python -m harness_bench run-openrouter \
+    --model gpt-4.1-nano --concurrency 5
+# run-openrouter retries transient HTTP/timeout/transport model errors up to
+# 5 total attempts per task before counting them as task failures. Override
+# with --transient-attempts if needed.
+
 # Run stock deepagents + GigaChat while bypassing the GigaChat harness
 # profile even if deepagents-gigachat is installed.
 uv run python -m harness_bench run-pure --concurrency 5
@@ -62,6 +108,53 @@ uv run python -m harness_bench run-pure --concurrency 5
 uv run python -m harness_bench run-cli \
     --cli-command 'free-code -p --model haiku --dangerously-skip-permissions' \
     --concurrency 5
+
+# Runner JSON writes best-effort per-task effort metrics:
+# agent_steps / agent_tool_calls / agent_shell_commands / agent_events,
+# plus agent_llm_calls / agent_input_tokens / agent_output_tokens /
+# agent_total_tokens when the backend exposes usage metadata. Codex CLI runs
+# auto-enable `codex exec --json` so those metrics can be read from JSONL.
+# `--json-output` is checkpointed after each completed task, so completed
+# results survive a later hang or interrupted run.
+uv run python -m harness_bench run-cli \
+    --cli-command 'codex exec -m gpt-5.5 --dangerously-bypass-approvals-and-sandbox' \
+    --concurrency 5 --json-output results.json
+
+# Repeat every selected task 5 times and print pass@K / pass^K
+# task-count metrics for K=1..5. Works for run, run-openrouter,
+# run-pure, and run-cli.
+uv run python -m harness_bench run-cli \
+    --cli-command 'free-code -p --model haiku --dangerously-skip-permissions' \
+    --attempts 5 --concurrency 5
+
+# Restrict the repeated-attempt summary to specific K values and write
+# the full per-attempt report as JSON.
+uv run python -m harness_bench run-cli \
+    --cli-command 'free-code -p --model haiku --dangerously-skip-permissions' \
+    --attempts 5 --pass@ 1 --pass@ 5 --pass^ 5 \
+    --json-output results.json
+
+# Drive `opencode` against any OpenAI-compatible deployment (example:
+# Qwen3.6-27B-FP8 served by vLLM). Point OPENCODE_CONFIG at a config
+# that registers a custom openai-compatible provider, sets the thinking
+# sampling (temp=0.6 top_p=0.95 top_k=20) and DISABLES formatter/LSP so
+# edits stay byte-exact for the verifiers (otherwise opencode auto-runs
+# a formatter and rewrites quotes/whitespace, failing exact checks):
+OPENCODE_CONFIG=/path/to/opencode-vllm.json \
+uv run python -m harness_bench run-cli \
+    --cli-command 'opencode run -m vllm/qwen3.6-27b' \
+    --timeout 900 --concurrency 5
+
+# Windows/Git Bash + cmd.exe CLIs with non-ASCII prompts/artifacts: force UTF-8
+# in both the outer shell and the Windows console before launching the runner.
+# `cmd.exe //c` is intentional for Git Bash/MSYS; keep `cmd /c` inside
+# `--cli-command` because that string is parsed by Python's subprocess, not MSYS.
+cmd.exe //c "chcp 65001 >nul" && \
+PYTHONUTF8=1 PYTHONIOENCODING=utf-8 LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+uv run python -m harness_bench run-cli \
+    --timeout 600 \
+    --cli-command 'cmd /c gigacode --approval-mode=auto-edit' \
+    --task task_05_greet --task task_35_remove_blank_lines
 
 # Verify the gold solutions without calling any model. Useful when
 # adding a new task — confirms the verifier accepts a hand-written
@@ -80,7 +173,7 @@ uv run python -m harness_bench apply-gold \
 
 ## What's inside
 
-### Tasks (231 total, task-set v0.3.0)
+### Tasks (298 total, task-set v0.7.0)
 
 | Module | Range | Wave |
 | --- | --- | --- |
@@ -90,7 +183,8 @@ uv run python -m harness_bench apply-gold \
 | `tasks_hard.py` | 101–150 | CSV / XLSX / SQLite aggregates, JSONL, Python impl + pytest, multi-file `grep`, Apache log parsing |
 | `tasks_extreme.py` | 151–205 | composite pipelines, archives, project-wide refactors, algorithms with pytest, statistics, XML / markdown, three-way joins |
 | `tasks_diagnostic.py` | 206–221 | paid-revenue reconciliation, inventory anomalies, pricing-API migration, latency reconstruction, tar+hash manifests, interval merge, config precedence, markdown link audit, data-quality reports, TODO/FIXME triage, category rollups, email extraction, runtime config, SQL leaderboards, import migrations, log-level summaries |
-| `tasks_memory.py` | 222–231 | memory discipline: read / write / forget / refuse facts in `MEMORY.md` along with the auxiliary deliverable (LICENSE, `requirements-dev.txt`, `bio.txt`, `profile.json`, …). Exercises agent memory rather than file I/O. |
+| `tasks_memory.py` | 222–253 | memory discipline: read / write / forget / refuse facts in `MEMORY.md` along with the auxiliary deliverable (LICENSE, `requirements-dev.txt`, `bio.txt`, `profile.json`, …). Exercises agent memory rather than file I/O. |
+| `tasks_agentic.py` | 254–298 | benchmark-like synthetic agentic wave: Terminal-Bench-like terminal workflows (logs, process tables, Makefile plans, checksums, permission audits), tau-like policy-bound action decisions (airline, retail, banking, clinic, etc.), and SWE-bench-like pytest bug-fix tasks. |
 
 Task prompts are in **Russian** — the bench is deliberately bilingual
 to keep models honest. The verifiers and gold answers are English / data
@@ -108,6 +202,10 @@ changes do not need a task-set bump.
 | `0.1.0` | 2026-05-13 | 1–200 | 200 | Initial extracted file/code/data benchmark |
 | `0.2.0` | 2026-05-19 | 201–221 | 221 | Advanced composites and diagnostic hard tasks |
 | `0.3.0` | 2026-05-21 | 222–231 | 231 | Memory-discipline tasks using `AGENTS.md` and `MEMORY.md` |
+| `0.4.0` | 2026-06-02 | 232–253 | 253 | Extended memory suite: knowledge update, contradiction resolution, temporal reasoning, abstention, preferences, multi-hop/multi-session |
+| `0.5.0` | 2026-06-02 | 254–262 | 262 | Agentic wave of synthetic Terminal-Bench-like, tau-like, and SWE-bench-like tasks |
+| `0.6.0` | 2026-06-02 | 263–283 | 283 | Agentic wave expanded to 10 Terminal-Bench-like / 10 tau-like / 10 SWE-bench-like tasks |
+| `0.7.0` | 2026-06-02 | 284–298 | 298 | Agentic wave expanded to 15 Terminal-Bench-like / 15 tau-like / 15 SWE-bench-like tasks |
 
 ### Infrastructure
 
@@ -165,81 +263,9 @@ needed when invoking Harbor's own local runner.
 
 ## Results
 
-Unless noted, runs use `--concurrency 5` on the 231-task set
-(`task-set v0.3.0`). The `pi-mono` row used `--concurrency 4`; the
-run completed 230/231 tasks and was stopped after
-`task_230_memory_forget_telegram` hung, so that task is counted as a
-failure in the table.
-Raw run directories are local artifacts and are ignored by git; the table
-below is a traceability summary, not a bundled replay log.
-GigaChat rows labeled PROM use the active password-auth `.env` setup
-(`GIGACHAT_BASE_URL=https://gigachat.sberdevices.ru/v1`); secrets are not
-tracked in this repository.
-
-| # | Date | Runner | Model | Harness adapt | Result | % |
-| --- | --- | --- | --- | --- | --- | --- |
-| 1 | 2026-05-21 | `free-code` 2.1.119 | **Claude Opus 4.7** | yes (built-in + AGENTS.md inject) | **231 / 231** | **100 %** |
-| 2 | 2026-05-22 | `free-code` 2.1.119 | **Claude Haiku 4.5** | yes (built-in + AGENTS.md inject) | **222 / 231** | **96.1 %** |
-| 3 | 2026-05-24 | `ouroboros` | **Claude Sonnet 4.6** (via OpenRouter, native tool calls) | yes (Ouroboros CLI adapter) | **222 / 231** | **96.1 %** |
-| 4 | 2026-05-24 | `ouroboros` | **Claude Haiku 4.5** (via OpenRouter, native tool calls) | yes (Ouroboros CLI adapter) | **215 / 231** | **93.1 %** |
-| 5 | 2026-05-24 | `deepagents` | **Claude Haiku 4.5** (via OpenRouter, `max_tokens=4096`) | no | **209 / 231** | **90.5 %** |
-| 6 | 2026-05-22 | `deepagents` | MiniMax-M2 (via OpenRouter) | no | 209 / 231 | 90.5 % |
-| 7 | 2026-05-22 | `deepagents` | DeepSeek V3.2-exp (via OpenRouter) | no | 208 / 231 | 90.0 % |
-| 8 | 2026-05-22 | `deepagents` | GLM-4.6 (via OpenRouter) | no | 206 / 231 | 89.2 % |
-| 9 | 2026-05-22 | `deepagents` | **GigaChat-3-Ultra** (PROM, deepagents 0.6.3 + langgraph 1.2.1) | **yes (v9 + memory wiring)** | **195 / 231** | **84.4 %** |
-| 10 | 2026-05-23 | `deepagents` | **GigaChat-3-Ultra** (PROM, deepagents 0.6.3) | **yes (v10 = v9 + `AgentsMdInjectMiddleware`)** | **194 / 231** | **84.0 %** |
-| 11 | 2026-05-24 | `pi-mono` 0.75.3 | GigaChat-3-Ultra (PROM, `@gigachain/pi-gigachat`) | yes (pi tools + AGENTS.md discovery) | 188 / 231 | 81.4 % |
-| 12 | 2026-05-22 | `deepagents` | DeepSeek V4 Flash (284B-A13B MoE) | no | 186 / 231 | 80.5 % |
-| 13 | 2026-05-25 | `OpenHands SDK` 1.22.1 | GigaChat-3-Ultra (PROM via `gpt2giga`) | yes (SDK CLI wrapper + AGENTS.md/MEMORY.md prompt wiring) | 183 / 231 | 79.2 % |
-| 14 | 2026-05-22 | `deepagents` | OpenAI gpt-oss-120b (120B dense) | no | 165 / 231 | 71.4 % |
-| 15 | 2026-05-24 | `deepagents` | GigaChat-3-Ultra (PROM) | no (baseline, no profile, `run-pure`) | 164 / 231 | 71.0 % |
-| 16 | 2026-05-22 | `deepagents` | Qwen3-235B-A22B-Instruct-2507 | no | 162 / 231 | 70.1 % |
-| 17 | 2026-05-25 | `gigacode cli` | unknown | unknown | 151 / 231 | 65.4 % |
-| 18 | 2026-05-23 | `ouroboros` | GigaChat-3-Ultra (PROM, native function-calling mode) | no | 136 / 231 | 58.9 % |
-| 19 | 2026-05-22 | `deepagents` | GLM-4-32B (32B dense) | no | 76 / 231 | 32.9 % |
-
-The full /200 and /221 task-set history (older runs done before the
-bench was extended), plus superseded /231 rows, lives in
-[`LEGACY_RESULTS.md`](LEGACY_RESULTS.md), along with a profile-evolution
-write-up for the GigaChat harness. Those numbers are **not directly
-comparable** across task-set sizes and should only be used to track a
-single model across time; superseded /231 rows are kept for traceability.
-
-### What the table shows
-
-- **Closed-source ceiling**: Claude Opus 4.7 and Haiku 4.5 saturate the
-  bench (100 % and 96 %). Any number above ~95 % is now bench-limited
-  rather than model-limited.
-- **Ouroboros + Claude via OpenRouter**: the 2026-05-24 Sonnet run ties
-  the recorded Claude-Code-style Haiku row at 222/231 and lands only
-  9 tasks behind the Opus ceiling. The Haiku run through the same
-  Ouroboros adapter scores 215/231, 7 tasks below both Sonnet/OpenRouter
-  and the Claude-Code-style Haiku row. There is no directly comparable
-  Claude Code Sonnet /231 row recorded in this table; older /200 Sonnet
-  rows in `LEGACY_RESULTS.md` are not directly comparable to the current
-  task set.
-- **Deepagents + Haiku via OpenRouter**: stock deepagents reaches
-  209/231 with `max_tokens=4096`, tying MiniMax-M2 and landing 6 tasks
-  behind the Ouroboros Haiku adapter run. Its misses skew toward file
-  side effects (rename/delete/missing output files), exact report format,
-  and a few composite data tasks.
-- **OSS top tier (no adapt)**: MiniMax-M2, DeepSeek V3.2-exp, GLM-4.6
-  group at 89-91 % with no model-specific harness profile.
-- **GigaChat profile contribution**: the
-  [`deepagents-gigachat`](https://github.com/ai-forever/deepagents-gigachat)
-  v9/v10 profile adds **+31/+30 tasks** over the latest stock
-  deepagents GigaChat baseline (164 → 195/194). On harness-bench it
-  places GigaChat-3-Ultra
-  above DeepSeek V4 Flash and the open-source mid tier.
-- **Pi-mono + GigaChat**: `pi-mono` 0.75.3 via
-  `@gigachain/pi-gigachat` reaches 188/231 on PROM. That puts it below
-  the GigaChat-specific deepagents profile, but above the stock
-  deepagents GigaChat baseline and the Ouroboros/GigaChat native
-  function-calling row.
-- **Old generations underperform**: GLM-4-32B (a pre-4.6 dense build)
-  scores only 33 %, two generations behind GLM-4.6. Agent capability
-  scaled much faster than raw quality in the open-source space during
-  2025.
+The current 298-task results table is kept at the top of this README. Older
+task-set histories and superseded runs live in [`LEGACY_RESULTS.md`](LEGACY_RESULTS.md);
+those numbers are not directly comparable with the current task set.
 
 ## Adding a task
 

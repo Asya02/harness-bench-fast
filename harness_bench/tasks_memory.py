@@ -839,7 +839,7 @@ def _verify_task_232(ws: Path) -> VerifyResult:
         ]
         for expr, expected in checks:
             res = python_callable_returns("calendar_rules.py", expr, expected)(ws)
-            if not res.ok:
+            if not res.passed:
                 return VerifyResult(False, f"calendar_rules.py behavior mismatch: {res.message}")
     except Exception as exc:  # pragma: no cover - defensive wrapper for bench diagnostics
         return VerifyResult(False, f"failed to execute calendar_rules.py checks: {exc}")
@@ -1290,8 +1290,9 @@ TASK_236 = Task(
     tags=("memory", "knowledge-update", "contradiction", "propagate", "hard"),
     prompt=(
         "У меня в памяти есть старый и новый AWS-регион. "
-        "Сделай так, чтобы в проекте везде остался только актуальный регион.\n"
-        "Нужно синхронно обновить `MEMORY.md`, `infra.auto.tfvars` и `deploy.yml`."
+        "Оставь в проекте только актуальный регион и полностью убери старый — "
+        "нигде его не упоминай, даже в комментариях или заметках.\n"
+        "Синхронно обнови `MEMORY.md`, `infra.auto.tfvars` и `deploy.yml`."
     ),
     setup_files={
         "AGENTS.md": _AGENTS_MD,
@@ -1442,7 +1443,7 @@ def _verify_task_238(ws: Path) -> VerifyResult:
     notes = data.get("notes")
     if not isinstance(notes, str):
         return VerifyResult(False, "notes must be a string")
-    if not re.search(r"(?iu)не\s+указ|нет|unknown|missing|not\s+provided", notes):
+    if not re.search(r"(?iu)не\s+указ|нет|неизвест|отсутств|unknown|missing|not\s+provided", notes):
         return VerifyResult(False, "notes should explicitly state that phone is unknown/missing")
     return VerifyResult(True, "unknown phone handled via abstention (null + explicit note)")
 
@@ -1553,7 +1554,7 @@ def _verify_task_240(ws: Path) -> VerifyResult:
     if not p.exists():
         return VerifyResult(False, "summary.txt missing")
     text = p.read_text(encoding="utf-8").strip()
-    lines = [l for l in text.splitlines() if l.strip()]
+    lines = [line for line in text.splitlines() if line.strip()]
     if len(lines) > 5:
         return VerifyResult(False, f"summary.txt has {len(lines)} lines; expected ≤ 5")
     if len(text) > 500:
@@ -1624,10 +1625,10 @@ def _verify_task_241(ws: Path) -> VerifyResult:
     if data.get("app") != "demo" or data.get("port") != 3000:
         return VerifyResult(False, "config.json data was changed; only formatting should change")
     content_lines = raw.splitlines()
-    indented = [l for l in content_lines if l and l[0] in (" ", "\t")]
+    indented = [line for line in content_lines if line and line[0] in (" ", "\t")]
     if not indented:
         return VerifyResult(False, "config.json has no indentation at all")
-    tab_lines = [l for l in indented if l.startswith("\t")]
+    tab_lines = [line for line in indented if line.startswith("\t")]
     if len(tab_lines) < len(indented) * 0.8:
         return VerifyResult(False, "config.json should use tabs for indentation")
     if ",\n" in raw and re.search(r",\s*[\]\}]", raw):
@@ -1648,7 +1649,9 @@ TASK_241 = Task(
         "MEMORY.md": _MEM_241,
         "config.json": _CONFIG_241_INITIAL,
     },
-    gold_files={},
+    gold_files={
+        "config.json": '{\n\t"app": "demo",\n\t"port": 3000,\n\t"debug": true,\n\t"features": [\n\t\t"auth",\n\t\t"logging",\n\t\t"metrics"\n\t]\n}\n',
+    },
     verifier=_verify_task_241,
 )
 
@@ -1737,7 +1740,11 @@ TASK_242 = Task(
         "README.md": _README_242_INITIAL,
         "package.json": _PACKAGE_242_INITIAL,
     },
-    gold_files={},
+    gold_files={
+        "MEMORY.md": '- Имя: Виктор Козлов\n- Компания: NewTech\n- Должность: Senior Developer\n- Email: victor@newtech.io\n',
+        "README.md": '# About\n\nVictor Kozlov — Senior Developer at NewTech.\nContact: victor@newtech.io\n',
+        "package.json": '{\n  "name": "victor-portfolio",\n  "version": "1.0.0",\n  "author": "Victor Kozlov <victor@newtech.io>"\n}\n',
+    },
     verifier=_verify_task_242,
 )
 
@@ -1787,14 +1794,19 @@ def _verify_task_243(ws: Path) -> VerifyResult:
 
     if not re.search(r"бег|кроссовк|running|спорт", all_items):
         return VerifyResult(False, "packing list should include running gear")
-    if re.search(r"латекс|latex", all_items):
-        return VerifyResult(False, "packing list should NOT include latex items (allergy!)")
-
+    # The latex allergy is verified deterministically via the notes/warnings,
+    # NOT by scanning item names. Substring matching can't distinguish a latex
+    # item ("латексные перчатки") from a latex-AVOIDING one ("без латекса",
+    # "нитрил вместо латексных"), and the correct response to the allergy is to
+    # pack latex-free gear — which necessarily contains the word "latex". So an
+    # item scan inevitably rejects correct lists. Requiring the notes to name
+    # latex specifically proves the agent integrated the allergen fact without
+    # ever penalizing a correct packing list.
     notes = data.get("notes")
     if not isinstance(notes, str):
         return VerifyResult(False, "notes must be a string")
-    if not re.search(r"(?iu)аллерг|латекс|latex|allerg", notes):
-        return VerifyResult(False, "notes should mention the latex allergy warning")
+    if not re.search(r"(?iu)латекс|latex", notes):
+        return VerifyResult(False, "notes must explicitly warn about the latex allergy")
     return VerifyResult(True, "packing list integrates all multi-session facts")
 
 
@@ -1812,7 +1824,9 @@ TASK_243 = Task(
         "AGENTS.md": _AGENTS_MD,
         "MEMORY.md": _MEM_243,
     },
-    gold_files={},
+    gold_files={
+        "packing_list.json": '{\n  "destination": "Стамбул",\n  "dates": "10–17 августа 2026",\n  "categories": {\n    "Одежда": [\n      "деловой casual (рубашки, брюки)",\n      "повседневная одежда",\n      "удобная обувь"\n    ],\n    "Спорт": [\n      "кроссовки для бега",\n      "спортивная форма"\n    ],\n    "Документы": [\n      "паспорт",\n      "страховка",\n      "наличные"\n    ],\n    "Техника": [\n      "ноутбук",\n      "зарядки"\n    ]\n  },\n  "notes": "Аллергия на латекс — избегать латексных изделий. Дресс-код на конференции: business casual."\n}\n',
+    },
     verifier=_verify_task_243,
 )
 
@@ -1827,7 +1841,11 @@ def _verify_task_244(ws: Path) -> VerifyResult:
     mt = mem.read_text(encoding="utf-8")
     checks = [
         (r"(?iu)база\s*(данных|BD|DB)\s*:\s*PostgreSQL|PostgreSQL", "PostgreSQL"),
-        (r"(?iu)(порт|port)\s*(БД|DB|базы)?\s*:\s*5433", "port 5433"),
+        # 5433 is a non-default Postgres port stated verbatim in the prompt, so
+        # recording it in any phrasing ("Порт: 5433", "на порту 5433",
+        # "PostgreSQL:5433") counts as remembering the fact. Don't over-fit to a
+        # single colon-delimited key:value form.
+        (r"5433", "port 5433"),
         (r"(?iu)Redis", "Redis"),
     ]
     for pattern, label in checks:
@@ -1866,7 +1884,10 @@ TASK_244 = Task(
         "AGENTS.md": _AGENTS_MD,
         "MEMORY.md": "",
     },
-    gold_files={},
+    gold_files={
+        "MEMORY.md": '- База данных: PostgreSQL\n- Порт PostgreSQL: 5433\n- Кэш: Redis\n',
+        ".env.example": 'DATABASE_URL=postgresql://user:your_password@localhost:5433/mydb\nREDIS_URL=redis://localhost:6379\n',
+    },
     verifier=_verify_task_244,
 )
 
@@ -2030,9 +2051,19 @@ def _verify_task_247(ws: Path) -> VerifyResult:
         return VerifyResult(False, "Dockerfile doesn't use uv")
     if "8080" not in text:
         return VerifyResult(False, "Dockerfile doesn't expose/use port 8080")
-    if re.search(r"\bpip\s+install\b", text):
-        return VerifyResult(False, "Dockerfile uses pip install (user prefers uv)")
-    if re.search(r"\bpoetry\b", text):
+    # The rule is "don't USE pip/poetry in build steps", so explanatory
+    # comments ("# без pip и без poetry") must not trip it. Strip full-line
+    # Dockerfile comments before the bans.
+    code = "\n".join(
+        "" if re.match(r"\s*#", line) else line for line in text.splitlines()
+    )
+    # `uv pip install` is uv's own pip-compatible interface — it IS using uv,
+    # so neutralize "uv pip" before the bare-pip ban. A standalone
+    # `RUN pip install ...` still fails.
+    code_no_uv_pip = re.sub(r"(?i)\buv\s+pip\b", "uv", code)
+    if re.search(r"\bpip\s+install\b", code_no_uv_pip):
+        return VerifyResult(False, "Dockerfile uses bare pip install (user prefers uv)")
+    if re.search(r"\bpoetry\b", code):
         return VerifyResult(False, "Dockerfile uses poetry (user dislikes it)")
     if not re.search(r"(?i)^FROM\s+python:3\.12-slim", text, re.MULTILINE):
         return VerifyResult(False, "Dockerfile FROM line doesn't use the preferred base")
@@ -2052,7 +2083,9 @@ TASK_247 = Task(
         "AGENTS.md": _AGENTS_MD,
         "MEMORY.md": _MEM_247,
     },
-    gold_files={},
+    gold_files={
+        "Dockerfile": 'FROM python:3.12-slim\n\nWORKDIR /app\n\nCOPY . .\n\nRUN apt-get update -qq && apt-get install -y curl \\\n    && curl -LsSf https://astral.sh/uv/install.sh | sh\n\nRUN /root/.local/bin/uv pip install --system -r requirements.txt\n\nEXPOSE 8080\n\nCMD ["python", "app.py"]\n',
+    },
     verifier=_verify_task_247,
 )
 
@@ -2115,7 +2148,10 @@ TASK_248 = Task(
         "MEMORY.md": _MEM_248_INITIAL,
         "contacts.yml": _CONTACTS_248_INITIAL,
     },
-    gold_files={},
+    gold_files={
+        "MEMORY.md": '- Имя: Настя\n- Email личный: nastya@personal.me\n- Телефон личный: +7-900-444-55-66\n',
+        "contacts.yml": 'name: Настя\npersonal_email: nastya@personal.me\npersonal_phone: "+7-900-444-55-66"\n',
+    },
     verifier=_verify_task_248,
 )
 
@@ -2239,7 +2275,10 @@ TASK_250 = Task(
         "AGENTS.md": _AGENTS_MD,
         "MEMORY.md": _MEM_250,
     },
-    gold_files={},
+    gold_files={
+        "user_model.py": 'from dataclasses import dataclass\nfrom typing import Optional\n\n\n@dataclass\nclass User:\n    name: str\n    age: int\n    city: str\n    email: Optional[str] = None\n    phone: Optional[str] = None\n',
+        "instance.json": '{\n  "name": "Артём",\n  "age": 29,\n  "city": "Самара",\n  "email": null,\n  "phone": null\n}\n',
+    },
     verifier=_verify_task_250,
 )
 
@@ -2274,7 +2313,7 @@ def _verify_task_251(ws: Path) -> VerifyResult:
     ]
     for expr, _ in checks:
         try:
-            res = python_callable_returns("convert.py", expr, None)(ws)
+            python_callable_returns("convert.py", expr, None)(ws)
         except Exception:
             return VerifyResult(False, f"convert.py failed on {expr}")
 
@@ -2303,7 +2342,10 @@ TASK_251 = Task(
         "AGENTS.md": _AGENTS_MD,
         "MEMORY.md": _MEM_251_INITIAL,
     },
-    gold_files={},
+    gold_files={
+        "MEMORY.md": '- Имя: Лена\n- Система мер: метрическая\n- Рост: 170 см\n',
+        "convert.py": 'def cm_to_inches(cm: float) -> float:\n    return cm / 2.54\n\n\ndef inches_to_cm(inches: float) -> float:\n    return inches * 2.54\n',
+    },
     verifier=_verify_task_251,
 )
 
@@ -2358,7 +2400,9 @@ TASK_252 = Task(
         "AGENTS.md": _AGENTS_MD,
         "MEMORY.md": _MEM_252,
     },
-    gold_files={},
+    gold_files={
+        "milestones.py": 'MILESTONES = [\n    ("alpha", "2026-03-01"),\n    ("beta",  "2026-06-15"),\n    ("rc",    "2026-08-01"),\n    ("ga",    "2026-10-01"),\n]\n\n\ndef next_milestone(today: str) -> str | None:\n    """Return name of nearest future milestone, or None if all past."""\n    for name, date in MILESTONES:\n        if today < date:\n            return name\n    return None\n',
+    },
     verifier=_verify_task_252,
 )
 
@@ -2427,7 +2471,10 @@ TASK_253 = Task(
         "AGENTS.md": _AGENTS_MD,
         "MEMORY.md": _MEM_253_INITIAL,
     },
-    gold_files={},
+    gold_files={
+        "MEMORY.md": '- Имя: Рустам\n- Язык: Rust\n- Компания: FerrisCorp\n- Должность: Tech Lead\n',
+        "README.md": '# Рустам\n\nTech Lead в FerrisCorp.\n\n## Стек\n\n- Язык: Rust\n',
+    },
     verifier=_verify_task_253,
 )
 

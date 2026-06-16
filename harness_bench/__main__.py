@@ -20,10 +20,12 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 
 from harness_bench.harbor_export import export_harbor_dataset
-from harness_bench.runner import run_all, summarize, verify_gold
+from harness_bench.metrics import default_metric_ks
+from harness_bench.runner import run_all, summarize, verify_gold, write_results_json
 from harness_bench.runner_cli import DEFAULT_CLI_COMMAND, DEFAULT_TIMEOUT_SECONDS, run_all_cli
 from harness_bench.runner_openrouter import DEFAULT_OPENROUTER_MODEL
 from harness_bench.runner_openrouter import run_all as run_all_openrouter
@@ -35,6 +37,24 @@ from harness_bench.versioning import (
     TASK_SET_VERSION,
     validate_task_set_metadata,
 )
+
+
+def _has_runtime_error(results: Sequence[object]) -> bool:
+    return any(bool(getattr(r, "error", None)) for r in results)
+
+
+def _exit_code(
+    results: Sequence[object],
+    *,
+    allow_task_failures: bool,
+    fail_on_runtime_error: bool = False,
+) -> int:
+    """Return the process exit code for a completed benchmark run."""
+    if fail_on_runtime_error and _has_runtime_error(results):
+        return 1
+    if allow_task_failures:
+        return 0
+    return 0 if all(getattr(r, "passed", False) for r in results) else 1
 
 
 def _cmd_list(_args: argparse.Namespace) -> int:
@@ -86,18 +106,49 @@ def _cmd_version(args: argparse.Namespace) -> int:
     return 1 if args.check and errors else 0
 
 
+def _maybe_write_json(args: argparse.Namespace, results: list) -> None:
+    json_output = getattr(args, "json_output", None)
+    if json_output:
+        write_results_json(results, json_output)
+        print(f"\nWrote results JSON to {json_output}")
+
+
+def _metric_ks_for_args(
+    args: argparse.Namespace,
+) -> tuple[tuple[int, ...], tuple[int, ...]] | None:
+    if args.attempts == 1 and not args.pass_at and not args.pass_hat:
+        return None
+    return _resolve_metric_ks(args)
+
+
+def _summarize_run(
+    results: list,
+    metric_ks: tuple[tuple[int, ...], tuple[int, ...]] | None,
+) -> None:
+    if metric_ks is None:
+        summarize(results)
+        return
+    pass_at_ks, pass_hat_ks = metric_ks
+    summarize(results, pass_at_ks=pass_at_ks, pass_hat_ks=pass_hat_ks)
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
+    metric_ks = _metric_ks_for_args(args)
     results = run_all(
         task_ids=args.task,
         keep_workspace=args.keep,
         recursion_limit=args.recursion_limit,
         concurrency=args.concurrency,
+        attempts=args.attempts,
+        json_output=args.json_output,
     )
-    summarize(results)
-    return 0 if all(r.passed for r in results) else 1
+    _summarize_run(results, metric_ks)
+    _maybe_write_json(args, results)
+    return _exit_code(results, allow_task_failures=args.allow_task_failures)
 
 
 def _cmd_run_openrouter(args: argparse.Namespace) -> int:
+    metric_ks = _metric_ks_for_args(args)
     results = run_all_openrouter(
         task_ids=args.task,
         model_name=args.model,
@@ -105,32 +156,50 @@ def _cmd_run_openrouter(args: argparse.Namespace) -> int:
         recursion_limit=args.recursion_limit,
         max_tokens=args.max_tokens,
         concurrency=args.concurrency,
+        harness_profile=args.harness_profile,
+        attempts=args.attempts,
+        json_output=args.json_output,
+        transient_attempts=args.transient_attempts,
+        fail_on_runtime_error=args.fail_on_runtime_error,
     )
-    summarize(results)
-    return 0 if all(r.passed for r in results) else 1
+    _summarize_run(results, metric_ks)
+    _maybe_write_json(args, results)
+    return _exit_code(
+        results,
+        allow_task_failures=args.allow_task_failures,
+        fail_on_runtime_error=args.fail_on_runtime_error,
+    )
 
 
 def _cmd_run_pure(args: argparse.Namespace) -> int:
+    metric_ks = _metric_ks_for_args(args)
     results = run_all_pure(
         task_ids=args.task,
         keep_workspace=args.keep,
         recursion_limit=args.recursion_limit,
         concurrency=args.concurrency,
+        attempts=args.attempts,
+        json_output=args.json_output,
     )
-    summarize(results)
-    return 0 if all(r.passed for r in results) else 1
+    _summarize_run(results, metric_ks)
+    _maybe_write_json(args, results)
+    return _exit_code(results, allow_task_failures=args.allow_task_failures)
 
 
 def _cmd_run_cli(args: argparse.Namespace) -> int:
+    metric_ks = _metric_ks_for_args(args)
     results = run_all_cli(
         task_ids=args.task,
         cli_command=args.cli_command,
         timeout=args.timeout,
         keep_workspace=args.keep,
         concurrency=args.concurrency,
+        attempts=args.attempts,
+        json_output=args.json_output,
     )
-    summarize(results)
-    return 0 if all(r.passed for r in results) else 1
+    _summarize_run(results, metric_ks)
+    _maybe_write_json(args, results)
+    return _exit_code(results, allow_task_failures=args.allow_task_failures)
 
 
 def _cmd_verify_gold(args: argparse.Namespace) -> int:
@@ -193,6 +262,81 @@ def _cmd_export_harbor(args: argparse.Namespace) -> int:
     return 0
 
 
+def _add_json_output(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--json-output",
+        dest="json_output",
+        default=None,
+        help=(
+            "Write a machine-readable JSON report (aggregate pass_rate plus a "
+            "per-task breakdown with tags) to this path."
+        ),
+    )
+
+
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"expected a positive integer, got {value!r}"
+        ) from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
+    return parsed
+
+
+def _add_metric_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "-k",
+        "--attempts",
+        type=_positive_int,
+        default=1,
+        help=(
+            "Run each selected task N independent times. Default: 1. "
+            "Use N > 1 to compute pass@K / pass^K for K=1..N."
+        ),
+    )
+    parser.add_argument(
+        "--pass-at",
+        "--pass@",
+        dest="pass_at",
+        action="append",
+        type=_positive_int,
+        metavar="K",
+        help=(
+            "Print pass@K (at least one of K attempts passes). Repeatable. "
+            "Defaults to all K values from 1 to --attempts."
+        ),
+    )
+    parser.add_argument(
+        "--pass-hat",
+        "--pass-caret",
+        "--pass^",
+        dest="pass_hat",
+        action="append",
+        type=_positive_int,
+        metavar="K",
+        help=(
+            "Print pass^K (all K attempts pass). Repeatable. "
+            "Defaults to all K values from 1 to --attempts."
+        ),
+    )
+
+
+def _resolve_metric_ks(args: argparse.Namespace) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    default_pass_at, default_pass_hat = default_metric_ks(args.attempts)
+    pass_at_ks = tuple(args.pass_at) if args.pass_at else default_pass_at
+    pass_hat_ks = tuple(args.pass_hat) if args.pass_hat else default_pass_hat
+    too_large = [k for k in (*pass_at_ks, *pass_hat_ks) if k > args.attempts]
+    if too_large:
+        joined = ", ".join(str(k) for k in too_large)
+        raise SystemExit(
+            f"Metric k cannot exceed --attempts ({args.attempts}); got: {joined}"
+        )
+    return pass_at_ks, pass_hat_ks
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m harness_bench")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -233,6 +377,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run up to N tasks in parallel (default: 1; uses a thread pool, "
         "each task still has its own isolated TemporaryDirectory).",
     )
+    _add_metric_args(p_run)
+    _add_json_output(p_run)
+    p_run.add_argument(
+        "--allow-task-failures",
+        action="store_true",
+        help=(
+            "Exit 0 when the harness completes even if some benchmark tasks fail. "
+            "Useful for smoke tests that validate runner mechanics rather than model quality."
+        ),
+    )
     p_run.set_defaults(func=_cmd_run)
 
     p_or = sub.add_parser(
@@ -260,6 +414,41 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_or.add_argument("--concurrency", type=int, default=1)
+    p_or.add_argument(
+        "--transient-attempts",
+        type=int,
+        default=5,
+        help=(
+            "Total attempts for transient model HTTP/timeout/transport errors "
+            "before counting the task as failed (default: 5)."
+        ),
+    )
+    _add_metric_args(p_or)
+    p_or.add_argument(
+        "--harness-profile",
+        dest="harness_profile",
+        default=None,
+        help=(
+            "Bridge a registered built-in deepagents harness profile onto the "
+            "chosen OpenRouter model so it actually applies (e.g. "
+            "'anthropic:claude-sonnet-4-6' for the built-in Claude Sonnet 4.6 "
+            "profile). The GigaChat profile is never registered by this runner."
+        ),
+    )
+    _add_json_output(p_or)
+    p_or.add_argument(
+        "--allow-task-failures",
+        action="store_true",
+        help="Exit 0 when the harness completes even if some benchmark tasks fail.",
+    )
+    p_or.add_argument(
+        "--fail-on-runtime-error",
+        action="store_true",
+        help=(
+            "Exit non-zero and stop scheduling more tasks when a task fails with "
+            "an agent/runtime exception recorded in the JSON error field."
+        ),
+    )
     p_or.set_defaults(func=_cmd_run_openrouter)
 
     p_pure = sub.add_parser(
@@ -273,6 +462,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_pure.add_argument("--keep", action="store_true", help="Keep temp workspaces")
     p_pure.add_argument("--recursion-limit", type=int, default=80)
     p_pure.add_argument("--concurrency", type=int, default=1)
+    _add_metric_args(p_pure)
+    _add_json_output(p_pure)
+    p_pure.add_argument(
+        "--allow-task-failures",
+        action="store_true",
+        help="Exit 0 when the harness completes even if some benchmark tasks fail.",
+    )
     p_pure.set_defaults(func=_cmd_run_pure)
 
     p_gold = sub.add_parser(
@@ -371,6 +567,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="Run up to N tasks in parallel (default: 1).",
+    )
+    _add_metric_args(p_cli)
+    _add_json_output(p_cli)
+    p_cli.add_argument(
+        "--allow-task-failures",
+        action="store_true",
+        help="Exit 0 when the harness completes even if some benchmark tasks fail.",
     )
     p_cli.set_defaults(func=_cmd_run_cli)
 
